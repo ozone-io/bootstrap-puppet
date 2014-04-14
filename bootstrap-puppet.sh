@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# 	Copyright 2014 Werner Buck
+#   Copyright 2014 Werner Buck
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,9 +14,27 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+
+###########################################################################################
+#
+# Ozone.io's provisioner for puppet masterless
+#
+# Features:
+# * Installs puppet, downloads puppet modules, runs puppet solo. Each stage can be run individually.
+# * Easily configurable due to the use of environment variables. * See test
+# * Runs on every unix distro BSD/Unix alike due to POSIX and /bin/sh compatibility. 
+#     A lot of distro's have been tested using vagrant. (See Vagrantfile)
+#
+# Credit:
+# * Helper functions are from Chef Omnitruck installer at opscode!
+# 
+############################################################################################
+
+#drop out at every error. //TODO: Use trap
 set -e
 
-#default variables
+#default options
+PUPPET_DEFAULT_ALWAYS_INSTALL_PUPPET="false"
 PUPPET_DEFAULT_INSTALL_SCRIPT="https://raw.githubusercontent.com/wernerb/puppet-install-shell/master/install_puppet.sh"
 PUPPET_DEFAULT_HIERA_YAML=":backends:
   - json
@@ -26,31 +44,22 @@ PUPPET_DEFAULT_HIERA_YAML=":backends:
   - common"
 
 PUPPET_DEFAULT_HIERA_DATA_COMMON="{
-	\"classes\": []
+  \"classes\": []
 }"
 
 PUPPET_DEFAULT_SITE_PP="hiera_include('classes')"
 
 #set default variables
+PUPPET_INSTALL_SCRIPT_ARGS=${PUPPET_INSTALL_SCRIPT_ARGS:-$PUPPET_DEFAULT_INSTALL_SCRIPT_ARGS}
+PUPPET_ALWAYS_INSTALL_PUPPET=${PUPPET_ALWAYS_INSTALL_PUPPET:-$PUPPET_DEFAULT_ALWAYS_INSTALL_PUPPET}
 PUPPET_INSTALL_SCRIPT=${PUPPET_INSTALL_SCRIPT:-"$PUPPET_DEFAULT_INSTALL_SCRIPT"}
 PUPPET_HIERA_YAML=${PUPPET_HIERA_YAML:-"$PUPPET_DEFAULT_HIERA_YAML"}
 PUPPET_HIERA_DATA_COMMON=${PUPPET_HIERA_DATA_COMMON:-"$PUPPET_DEFAULT_HIERA_DATA_COMMON"}
 PUPPET_SITE_PP=${PUPPET_SITE_PP:-"$PUPPET_DEFAULT_SITE_PP"}
 
-# Set up colours
-if tty -s;then
-    RED=${RED:-$(tput setaf 1)}
-    GREEN=${GREEN:-$(tput setaf 2)}
-    YLW=${YLW:-$(tput setaf 3)}
-    BLUE=${BLUE:-$(tput setaf 4)}
-    RESET=${RESET:-$(tput sgr0)}
-else
-    RED=
-    GREEN=
-    YLW=
-    BLUE=
-    RESET=
-fi
+###########################################################################################
+# helper functions. Skip to end.
+###########################################################################################
 
 # Timestamp
 now () {
@@ -59,19 +68,19 @@ now () {
 
 # Logging functions instead of echo
 log () {
-    echo "${BLUE}`now`${RESET} ${1}"
+    echo "`now` ${1}"
 }
 
 info () {
-    log "${GREEN}INFO${RESET}: ${1}"
+    log "INFO: ${1}"
 }
 
 warn () {
-    log "${YLW}WARN${RESET}: ${1}"
+    log "WARN$: ${1}"
 }
 
 critical () {
-    log "${RED}CRIT${RESET}: ${1}"
+    log "CRIT: ${1}"
 }
 
 # Check whether a command exists - returns 0 if it does, 1 if it does not
@@ -252,66 +261,6 @@ do_perl() {
   return 0
 }
 
-# do_python URL FILENAME
-do_python() {
-  info "Trying python..."
-  python -c "import sys,urllib2 ; sys.stdout.write(urllib2.urlopen(sys.argv[1]).read())" "$1" > "$2" 2>$tmp_stderr
-  rc=$?
-  # check for 404
-  grep "HTTP Error 404" $tmp_stderr 2>&1 >/dev/null
-  if test $? -eq 0; then
-    critical "ERROR 404"
-    unable_to_retrieve_package
-  fi
-
-  # check for bad return status or empty output
-  if test $rc -ne 0 || test ! -s "$2"; then
-    capture_tmp_stderr "python"
-    return 1
-  fi
-  return 0
-}
-
-do_checksum() {
-  if exists sha256sum; then
-    checksum=`sha256sum $1 | awk '{ print $1 }'`
-    if test "x$checksum" != "x$2"; then
-      checksum_mismatch
-    else
-      info "Checksum compare with sha256sum succeeded."
-    fi
-  elif exists shasum; then
-    checksum=`shasum -a 256 $1 | awk '{ print $1 }'`
-    if test "x$checksum" != "x$2"; then
-      checksum_mismatch
-    else
-      info "Checksum compare with shasum succeeded."
-    fi
-  elif exists md5sum; then
-    checksum=`md5sum $1 | awk '{ print $1 }'`
-    if test "x$checksum" != "x$3"; then
-      checksum_mismatch
-    else
-      info "Checksum compare with md5sum succeeded."
-    fi
-  elif exists md5; then
-    checksum=`md5 $1 | awk '{ print $4 }'`
-    if test "x$checksum" != "x$3"; then
-      checksum_mismatch
-    else
-      info "Checksum compare with md5 succeeded."
-    fi
-  else
-    warn "Could not find a valid checksum program, pre-install shasum, md5sum or md5 in your O/S image to get valdation..."
-  fi
-}
-
-checksum_mismatch() {
-  critical "checksum mismatch!"
-  report_bug
-  exit 1
-}
-
 # do_download URL FILENAME
 do_download() {
   info "Downloading $1"
@@ -371,81 +320,145 @@ capture_tmp_stderr() {
   fi
 }
 
-trap "rm -f $tmp_stderr; rm -rf $tmp_dir; exit $1" 1 2 15
+###########################################################################################
+# Start of main logic
+###########################################################################################
 
-#start main script logic
+#############
+# Install Stage: Installs puppet
+# * Is a bootstrapping stage: Only installs essentials, does not configure.
+#############
+install_stage() {
+  info "-- start install stage"
 
-info "-- start script $0"
-info "-- detected os details:"
-info ""
-info "Version: $version"
-info "Platform: $platform"
-info "Platform Version: $platform_version"
-info "Machine: $machine"
-info "OS: $os"
-info ""
+  info "-- installling puppet"
+  if [ "x$PUPPET_ALWAYS_INSTALL_PUPPET" = "xtrue" ] || ! puppet --version >/dev/null 2>&1; then
+    info "-- pppet not detected or installation is forced"
+    info "-- download puppet install script to $tmp_dir/puppet-install.sh"
+    do_download "$PUPPET_INSTALL_SCRIPT" "$tmp_dir/puppet-install.sh" 
+    info "-- run puppet install script sh $tmp_dir/puppet-install.sh $PUPPET_INSTALL_SCRIPT_ARGS"
+    sh "$tmp_dir/puppet-install.sh" "$PUPPET_INSTALL_SCRIPT_ARGS"
+    info "-- finished puppet install script"
+  else 
+    info "-- puppet found. skipping puppet installation"
+  fi
 
-info "-- download puppet install script to $tmpdir/puppet-install.sh"
-do_download "$PUPPET_INSTALL_SCRIPT" "$tmp_dir/puppet-install.sh" 
-info "-- run puppet install script sh $tmp_dir/puppet-install.sh"
-sh "$tmp_dir/puppet-install.sh"
-info "-- finished puppet install script"
-info "-- checking if puppet forge modules need to be installed."
-if [ ! "x$PUPPET_FORGE_MODULES" = "x" ]; then
-	info "-- puppet forge modules found"
-	#delete all modules if present. puppet module install cannot replace modules automatically without forgetting dependencies
-	warn "-- removing all modules in /etc/puppet/modules/"
-	rm -rf /etc/puppet/modules/*
-	OLDIFS=$IFS
-	IFS='
-	'
-	for p in $PUPPET_FORGE_MODULES; do
-	    info "---- downloading and installing puppet forge module $p"
-	    puppet module install "$p"
-	done
-	IFS=$OLDIFS
-	info "-- finished installation puppet modules"
-else 
-	warn "-- no puppet forge modules defined"
-fi
+  info "-- finished install stage"
+}
 
-info "-- checking if tarred modules need to be installed."
-if [ ! "x$PUPPET_MODULES" = "x" ]; then
-	info "-- tarred modules found"
-	OLDIFS=$IFS
-	IFS='
-	'
-	for p in $PUPPET_MODULES; do
-		folder=$(echo "$p" | cut -d ';' -f1)
-		url=$(echo "$p" | cut -d ';' -f2)
-		tarfolder=$(echo "$p" | cut -d ';' -f3)
-		if [ ! "x$folder" = "x" ] && [ ! "x$url" = "x" ]; then
-			mkdir -p "$tmp_dir/$folder"
-	    	info "---- downloading and installing puppet module $folder at $url on path $tarfolder"
-	    	do_download "$url" "$tmp_dir/$folder.tar.gz"
-	    	info "---- deleting old module if it exists"
-	    	rm -rf "/etc/puppet/modules/$folder"
-	    	info "---- untarring archive $tmp_dir/$folder.tar.gz to $tmp_dir/$folder"
-	    	tar -zxf "$tmp_dir/$folder.tar.gz" -C "$tmp_dir/$folder"
-	    	info "---- moving $tmp_dir/$folder""$tarfolder to /etc/puppet/modules/$folder"
-	    	mv -f "$tmp_dir/$folder""$tarfolder" "/etc/puppet/modules/$folder"
-		else 
-			warn "---- $p has been incorrectly passed. skipping"
-		fi
-	done
-	IFS=$OLDIFS
-else 
-	warn "-- no tarred modules defined"
-fi
 
-info "-- filling puppet data in /etc/hiera.yaml /etc/puppet/hiera/common.csv and /etc/puppet/manifests/site.pp"
-echo "$PUPPET_HIERA_YAML" > /etc/hiera.yaml
-ln -f -s /etc/hiera.yaml /etc/puppet/hiera.yaml
-mkdir -p /etc/puppet/hiera
-echo "$PUPPET_HIERA_DATA_COMMON" > /etc/puppet/hiera/common.json
-mkdir -p /etc/puppet/manifests
-echo "$PUPPET_SITE_PP" > /etc/puppet/manifests/site.pp
+#############
+# Configure Stage: Downloads Puppet Forge/Tar modules, installs them. Also (re)sets configuration files.
+#############
 
-info "-- run puppet apply --verbose --modulepath=/etc/puppet/modules /etc/puppet/manifests/site.pp"
-puppet apply --verbose --modulepath=/etc/puppet/modules /etc/puppet/manifests/site.pp
-info "-- finished puppet apply run"
+configure_stage() {
+  info "-- start configure stage"
+
+  info "-- writing file /etc/hiera.yaml"
+  echo "$PUPPET_HIERA_YAML" > /etc/hiera.yaml
+  info "-- finished writing to /etc/hiera.yaml"
+
+  info "-- creating symbolic link from /etc/hiera.yaml to /etc/puppet/hiera.yaml"
+  ln -f -s /etc/hiera.yaml /etc/puppet/hiera.yaml
+  info "-- finished symbolic link creation /etc/hiera.yaml"
+
+  info "-- writing file /etc/puppet/hiera/common.json"
+  mkdir -p /etc/puppet/hiera
+  echo "$PUPPET_HIERA_DATA_COMMON" > /etc/puppet/hiera/common.json
+  info "-- finished writing to /etc/puppet/hiera/common.json"
+
+  info "-- writing file /etc/puppet/manifests/site.pp"
+  mkdir -p /etc/puppet/manifests
+  echo "$PUPPET_SITE_PP" > /etc/puppet/manifests/site.pp
+  info "-- finished writing to /etc/puppet/hiera/site.pp"
+  
+  #Download/replace puppet forge modules
+  info "-- checking if puppet forge module(s) need to be downloaded and installed."
+  if ! test "x$PUPPET_FORGE_MODULES" = "x"; then
+    info "-- puppet forge module(s) found"
+    #Delete all modules if present. 
+    #Puppet module install cannot replace modules automatically without forgetting dependencies.
+    warn "-- removing all modules in /etc/puppet/modules/"
+    rm -rf /etc/puppet/modules/*
+    OLDIFS=$IFS
+    IFS='
+'
+    for p in $PUPPET_FORGE_MODULES; do
+        info "---- downloading and installing puppet forge module $p"
+        puppet module install "$p"
+        info "---- installed puppet forge module $p"
+    done
+    IFS=$OLDIFS
+    info "-- finished installation puppet module(s)"
+  else 
+    warn "-- no puppet forge modules. not downloading."
+  fi
+
+  #Download/replcace puppet tarred modules
+  #Format is "namemodule;https://whatever/urlofmodule.tar.gz;pathintartomodule"
+  #pathintartomodule is optional.
+  info "-- checking if puppet tarred modules need to be downloaded and installed."
+  if ! test "x$PUPPET_MODULES" = "x"; then
+    info "-- tarred modules found"
+    OLDIFS=$IFS
+    IFS='
+'
+    for p in $PUPPET_MODULES; do
+      modulefolder=$(echo "$p" | cut -d ';' -f1)
+      moduleurl=$(echo "$p" | cut -d ';' -f2)
+      moduletarfolder=$(echo "$p" | cut -d ';' -f3)
+      if [ ! "x$modulefolder" = "x" ] && [ ! "x$moduleurl" = "x" ]; then
+        mkdir -p "$tmp_dir/$modulefolder"
+        info "---- downloading and installing puppet module $modulefolder at $moduleurl on path $moduletarfolder"
+        do_download "$moduleurl" "$tmp_dir/$modulefolder.tar.gz"
+        info "---- deleting old module if it exists"
+        rm -rf "/etc/puppet/modules/$modulefolder"
+        info "---- untarring archive $tmp_dir/$modulefolder.tar.gz to $tmp_dir/$modulefolder"
+        tar -zxf "$tmp_dir/$modulefolder.tar.gz" -C "$tmp_dir/$modulefolder"
+        info "---- moving $tmp_dir/$modulefolder""$moduletarfolder to /etc/puppet/modules/$modulefolder"
+        mv -f "$tmp_dir/$modulefolder""$moduletarfolder" "/etc/puppet/modules/$modulefolder"
+      else 
+        critical "---- $p has been incorrectly passed."
+      fi
+    done
+    IFS=$OLDIFS
+  else 
+    warn "-- no tarred modules provided. not installing modules."
+  fi
+
+  info "-- finished configure stage"
+}
+
+#############
+# Run Stage: Executes puppet apply.
+#############
+run_stage() {  
+  info "-- start run stage"
+
+  info "-- run puppet apply --modulepath=/etc/puppet/modules /etc/puppet/manifests/site.pp"
+  puppet apply --modulepath=/etc/puppet/modules /etc/puppet/manifests/site.pp
+  info "-- finished puppet apply run"
+  
+  info "-- finished run stage"
+}
+
+############
+# Pick your stages: If you supply an argument with install, configure or run, you can run each stage individually. 
+############
+
+case "$1" in
+    "install")
+      install_stage
+    ;;
+    "configure")
+      configure_stage
+    ;;
+    "run")
+      run_stage
+    ;;
+    *)
+      install_stage
+      configure_stage
+      run_stage
+    ;;
+esac
