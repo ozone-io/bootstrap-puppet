@@ -285,10 +285,6 @@ do_download() {
     do_perl $1 $2 && return 0
   fi
 
-  if exists python; then
-    do_python $1 $2 && return 0
-  fi
-
   critical "Could not download file. No download methods available."
 }
 
